@@ -1,0 +1,491 @@
+---
+title: "Tayna Nature Reserve - Fast Transect Survey"
+author: "Michel et al. (in prep)"
+date: "2024-03-13"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+unzip("TNR_great_ape_survey_2020_data.zip", exdir = "TNR_great_ape_survey_2020_data", junkpaths = TRUE)
+
+folder <- "TNR_great_ape_survey_2020_data/"
+
+# load required packages
+library(raster)
+library(sf)
+library(mgcv)
+library(spdep)
+library(gstat)
+transp <- function(col, alpha=.5){
+  res <- apply(col2rgb(col),2, function(c) rgb(c[1]/255, c[2]/255, c[3]/255, alpha))
+  return(res)
+}
+
+# plotting parameters
+par(mfrow=c(1,1),pch=20,bty="l",las=1)
+```
+
+
+## Load data & set up dummy points
+
+code not shown in print-out
+
+```{r, include=FALSE}
+# load DEM of Tayna area
+dem <- raster(paste0(folder,"s01_e028_1arc_v3.tif")) #DEM tile (in WGS84)
+dem36 <- projectRaster(dem, crs="+proj=utm +zone=36 +south +datum=WGS84 +units=m +no_defs") 
+
+# load shapefile map of Tayna
+map <- as(terra::vect(paste0(folder,"tayna.shp")), "Spatial") #map polygon (in WGS84)
+map36 <- spTransform(map,crs(dem36))
+
+# load shapefile of transects
+transects <- as(terra::vect(paste0(folder,"transects50m.shp")), "Spatial") #transects buffered 50m each side = ~2 km x 100m wiggly lines (in WGS84)
+transects36 <- transects36m <- spTransform(transects, crs(map36))
+projection(transects36) <- gsub("units=m", "units=km", projection(transects36))
+transects$area <- st_area(st_as_sf(transects36))/1000000
+
+# load settlements rasterized point-ized vector
+defrst <- terra::vect(paste0(folder,"settlement_polygons_36S_clipped2km.shp")) #manually-created polygons (drawn over sat image)
+settlements <- raster(paste0(folder,"settlementsKdGrid4945h1000.tif")) #settlements map, which took the above and converted to a raster by kernel density estimation (Grid=4945, h=1000)
+
+# load animal data
+waypoints <- read.csv(paste0(folder,"TNR_transect_survey_2020.csv")) #transect observations data table
+
+# Format dataset
+coordinates(waypoints) <- c("Longitude", "Latitude")
+proj4string(waypoints) <- CRS("+proj=longlat +datum=WGS84 +ellps=WGS84")
+
+# only keep observations that were on transect
+waypointsOnTr <- waypoints[transects,] # weird syntax of over function (sp)
+nrow(waypointsOnTr); g = nrow(waypointsOnTr)
+waypointsTr <- as.data.frame(waypointsOnTr)
+waypointsTr$Anim <- 1
+waypointsTr <- waypointsTr[,c(ncol(waypointsTr),1:(ncol(waypointsTr)-1))]
+
+
+
+## For evaluating the effect of pseudo-absence points - re-randomize 100 times ---------
+
+
+# gorillaSeeds <- list()
+# for (seedtesting in 1:100){
+
+## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ## ## 
+
+
+bkgndPts <- setNames(data.frame(matrix(ncol = 2, nrow = 0)),c("x", "y"))
+for (i in 1:length(transects)) {
+  # loop over transects and get j random points within 100m buffer
+  set.seed(80) #replace with your favorite number or "seedtesting" during iterations
+  j <- as.numeric(round(transects[i,]$area*239.862)) #to get 10,000 total points over 41km2
+  rand <- spsample(transects[i,],n=j,"random")
+  # rand <- spsample(transects[i,],n=j,"random") 
+  rand <- as.data.frame(rand@coords)
+  names(rand) <- c("x","y")
+  bkgndPts <- rbind(rand,bkgndPts)
+}
+bkgndPts$Longitude = bkgndPts$x; bkgndPts$Latitude = bkgndPts$y
+coordinates(bkgndPts) <- ~ Longitude + Latitude
+proj4string(bkgndPts) <- CRS("+proj=longlat +datum=WGS84")
+bkgndPts <- bkgndPts[0]
+bkgndPts@data[names(waypointsTr)] <- NA
+bkgndPts$Anim = 0
+bkgndPtsDf <- as.data.frame(bkgndPts)
+bkgndPtsDf$Latitude = bkgndPtsDf$Latitude.1
+bkgndPtsDf$Longitude = bkgndPtsDf$Longitude.1
+bkgndPtsDf <- bkgndPtsDf[,-c(ncol(bkgndPtsDf)-1, ncol(bkgndPtsDf))]
+
+# combine observations and dummy points
+response <- rbind(waypointsTr,bkgndPtsDf)
+coordinates(response) <- ~ Longitude + Latitude
+proj4string(response) <- CRS("+proj=longlat +datum=WGS84")
+sum(response$Anim==0);sum(response$Anim==1) #check numbers of each
+(responseUTM <- spTransform(response,crs("+proj=utm +zone=36 +south +datum=WGS84 +units=m +no_defs +ellps=WGS84 +towgs84=0,0,0")))
+responseUTM$speciesName <- ifelse(responseUTM$Anim==0,"background.point",responseUTM$speciesName)
+responseUTM$Longitude <- responseUTM@coords[,1]
+responseUTM$Latitude <- responseUTM@coords[,2]
+
+# *extract predictors at response points ----
+
+#Elevation #reproject to UTM 36S
+dem36 <- projectRaster(dem, crs="+proj=utm +zone=36 +south +datum=WGS84 +units=m +no_defs") 
+
+#Terrain Ruggedness Index
+tri <- terrain(dem36, opt = 'TRI')  #calculate TRI
+
+#generate regular points grid
+map36.buff = terra::buffer(map36,width = 2000) 
+regpts <- spsample(map36.buff,n=15000,"regular")
+regpts <- as.data.frame(regpts@coords)
+names(regpts) <- c("Longitude","Latitude")
+coordinates(regpts) <- ~ Longitude + Latitude
+proj4string(regpts) <- CRS("+proj=utm +zone=36 +south +datum=WGS84 +units=m +no_defs")
+regptsUTM <- SpatialPointsDataFrame(regpts,as.data.frame(rep(0,length(regpts))))[,0]
+
+#get the coordinate points from the raster itself
+#Lat/Lon raster
+maskedDem <- mask(crop(dem36, map36.buff), map36.buff)
+rlon<-rlat<-maskedDem
+xy<-xyFromCell(maskedDem,1:length(maskedDem)) #matrix of logitudes (x) and latitudes(y)
+rlon[]<-xy[,1] #raster of longitudes
+rlat[]<-xy[,2] #raster of latitides
+latlon <- stack(rlon, rlat)
+names(latlon) = c("Longitude","Latitude")
+latlon <- mask(crop(latlon, map36.buff), map36.buff)
+
+a = Sys.time() #this takes some time
+triExt <- extract(tri,regptsUTM,buffer = 1000,fun = mean,sp = TRUE)
+Sys.time() - a
+tri1km <- rasterFromXYZ(triExt, crs=tri)
+crs(tri1km) <- crs("+proj=utm +zone=36 +south +datum=WGS84 +units=m +no_defs")
+# plot(tri1km)
+
+#Settlements Map #resample to match DEM
+settlementsRe <- resample(settlements, dem36)
+settlementsR <- settlementsRe/cellStats(settlementsRe, max)
+
+#Model spatial distribution of mining activity (Carriere/exploitatation artisanale/d'or, Carriere abandonnee)
+miningUTM <- responseUTM[responseUTM$activityType=="mining" | responseUTM$Anim==0,]
+miningUTM$mines <- miningUTM$Anim
+miningGAM <- gam(mines ~ s(Longitude,Latitude), data = miningUTM, family = "binomial", method="REML")
+summary(miningGAM)
+# plot(miningGAM)
+# gam.check(miningGAM)
+
+snaringUTM <- responseUTM[responseUTM$activityType=="snaring" | responseUTM$Anim==0,]
+snaringUTM$snares <- snaringUTM$Anim
+snaringGAM <- gam(snares ~ s(Longitude,Latitude), data = snaringUTM, family = "binomial", method="REML")
+summary(snaringGAM)
+
+predFunResponse <- function(model, data) {
+  predict(model, data, type="response", se.fit=FALSE)
+}
+a = Sys.time()
+miningProb <- raster::predict(latlon, miningGAM, fun=predFunResponse, na.rm = T, inf.rm = T)
+Sys.time() - a #1 minute
+
+#scale the map by the mean density of mines
+(meanMineDens = nrow(miningUTM[miningUTM$mines==1,])/sum(transects$area))
+(meanMineProb <- cellStats(miningProb$layer, 'mean'))
+miningDens <- calc(miningProb$layer,fun=function(x){return((x)*as.numeric(meanMineDens)/meanMineProb)})
+# plot(miningDens)
+
+#Closest transect raster - did not use in model, for organization of data
+regptsVec <- terra::vect(regptsUTM)
+regptsVec$id <- 1:length(regptsVec)
+trDist <- data.frame()
+a = Sys.time() #takes some time
+for (i in unique(transects36m$Trans)){
+  transects36mvec <- terra::vect(transects36m[transects36m$Trans==i,1])
+  transectR <- terra::nearest(regptsVec, transects36mvec, centroids=FALSE)
+  # plot(transectR, pch=20, cex=0.5)
+  # plot(regptsUTM, add=T)
+  # plot(transects36mvec, add=T, col="red")
+  transectR$Trans <- i
+  trDist <- rbind(trDist, as.data.frame(transectR))
+}
+(a = Sys.time() - a) #takes some time
+trMinDists <- data.frame()
+for (j in unique(trDist$from_id)){
+  trDistj <- trDist[trDist$from_id==j,]
+  trMinDists <- rbind(trMinDists, trDistj[trDistj$distance==min(trDistj$distance),])
+}
+Sys.time() - a
+trMinDists1 <- trMinDists
+trMinDists1$id = trMinDists$from_id
+regptsTrans <- merge(regptsVec, trMinDists1, by="id")
+regptsT <- as(regptsTrans[,c(1,7)], "Spatial")
+regptsT$Trans <- as.numeric(regptsT$Trans)
+transectR <- rasterize(regptsT, rlon)$Trans
+
+#Make a raster stack
+demP <- crop(dem36, tri1km); settlementsP <- crop(settlementsR, tri1km); miningP <- crop(miningDens, tri1km); transectP <- crop(transectR, tri1km)
+demP <- resample(demP, tri1km);settlementsP <- resample(settlementsP, tri1km);miningP <- resample(miningP, tri1km);transectP <- resample(transectP, tri1km)
+predictorsMap <- stack(mask(demP,map36.buff), tri1km, mask(settlementsP,map36.buff), miningP, round(transectP$Trans))
+names(predictorsMap) = c("altitude","ruggedness","settlement.index", "mine.density", "transect")
+predictorsMap
+predictorsMapClip <- mask(predictorsMap, map36)
+
+## Prepare to plot predictors
+specCol <- rev(RColorBrewer::brewer.pal(11,"Spectral"))
+defrstcrp <- terra::crop(terra::project(defrst, crs(map36)), map36)
+```
+
+
+## Figure 2
+
+```{r fig2, echo=FALSE}
+## Plot predictors Figure ----
+par(mfrow=c(2,2), mar=c(0,0,0,0)+1)
+
+#1
+plot(predictorsMapClip[[1]], col=specCol, legend.args = list(text = 'm asl', side = 3, font = 2, line = 0.5, adj=-0.2), bty="n", box=FALSE, axes=FALSE)
+title("Altitude", line = -1)
+scalebar(d = 10000, xy = c(31000,9945000),lonlat = F,label = "10 km", adj=c(0.5,-0.4),lwd = 2)
+
+#2
+plot(predictorsMapClip[[2]], col=specCol, legend.args = list(text = 'TRI', side = 3, font = 2, line = 0.5, adj=-0.2), bty="n", box=FALSE, axes=FALSE)
+title("Terrain ruggedness", line = -1)
+scalebar(d = 10000, xy = c(31000,9945000),lonlat = F,label = "10 km", adj=c(0.5,-0.4),lwd = 2)
+
+#3
+plot(predictorsMapClip[[3]], col=specCol, legend.args = list(text = 'SI', side = 3, font = 2, line = 0.5, adj=-0.4), bty="n", box=FALSE, axes=FALSE)
+plot(defrstcrp, col=transp("black",0.6), border=NA, add=T, pch=20, cex=0.1)
+title("Settlement index (SI)", line = -1)
+scalebar(d = 10000, xy = c(31000,9945000),lonlat = F,label = "10 km", adj=c(0.5,-0.4),lwd = 2)
+
+#4
+plot(predictorsMapClip[[4]], col=specCol, legend.args = list(text = 'signs/km2', side = 3, font = 2, line = 0.5, adj=0.2), bty="n", box=FALSE, axes=FALSE)
+title("Mine density", line = -1)
+scalebar(d = 10000, xy = c(31000,9945000),lonlat = F,label = "10 km", adj=c(0.5,-0.4),lwd = 2)
+points(spTransform(miningUTM[miningUTM$Anim==1,], crs(map36)), pch=4, cex=0.7)
+```
+
+```{r moreprep, include=FALSE}
+#extract predictors at response points for modeling and plotting
+#alt,settlement.index
+responseUTMalt <- extract(dem36, responseUTM, sp = TRUE); names(responseUTMalt)[32] = "altitude"
+responseUTMaltStl <- extract(settlementsR, responseUTMalt, sp = TRUE); names(responseUTMaltStl)[33] = "settlement.index"
+responseUTMaltStlTri <- extract(tri1km, responseUTMaltStl, buffer = 1000, fun = mean, sp = TRUE); names(responseUTMaltStlTri)[34] = "ruggedness"
+responseUTMaltStlTriMng <- extract(miningDens, responseUTMaltStlTri, sp = TRUE); names(responseUTMaltStlTriMng)[35] = "mine.density"
+responseUTMaltStlTriMngTrans <- extract(round(transectP$Trans), responseUTMaltStlTriMng, sp = TRUE); names(responseUTMaltStlTriMngTrans)[36] = "transect"
+responseUTMaltStlTriMngTrans$transect = factor(responseUTMaltStlTriMngTrans$transect)
+
+### Functions to generate predictions based on the model  ###
+predFunLink <- function(model, data) {
+  v <- predict(model, data, type="link", se.fit=TRUE)
+  cbind(p=as.vector(v$fit), se=as.vector(v$se.fit))
+}
+predFunResponse <- function(model, data) {
+  predict(model, data, type="response", se.fit=FALSE)
+}
+
+colfunc <- function(n) {
+  f1 <- colorRampPalette(c("#67001F", "#B2182B"))
+  f2 <- colorRampPalette(c("#B2182B", "#D6604D"))
+  f3 <- colorRampPalette(c("#D6604D", "#F4A582"))
+  f4 <- colorRampPalette(c("#F4A582", "#FDDBC7"))
+  f5 <- colorRampPalette(c("#FDDBC7", "#F7F7F7"))
+  f6 <- colorRampPalette(c("#F7F7F7", "#D1E5F0"))
+  f7 <- colorRampPalette(c("#D1E5F0", "#92C5DE"))
+  f8 <- colorRampPalette(c("#92C5DE", "#4393C3"))
+  f9 <- colorRampPalette(c("#4393C3", "#2166AC"))
+  f10 <- colorRampPalette(c("#2166AC", "#053061"))
+  return(transp(c(f1(n/10),f2(n/10),f3(n/10),f4(n/10),f5(n/10),f6(n/10),f7(n/10),f8(n/10),f9(n/10),f10(n/10)), alpha = 0.8))
+}
+```
+
+
+## Animal distribution models
+
+```{r mods, warning=FALSE}
+
+animals <- as.list(c("Pan t|Gorilla|background.point","Gorilla|background.point","Pan t|background.point","Cerc|background.point",
+                     "Phil|Ceph|background.point","Potam|background.point"))
+names(animals) <- c("0. Great apes","a. Gorillas", "b. Chimpanzees", "c. Monkeys","d. Duikers","e. Red river hogs")
+
+for (i in names(animals)){
+  animals[[i]]$data <- (responseUTMaltStlTriMngTrans[grep(animals[[i]][[1]],responseUTMaltStlTriMngTrans$speciesName),])
+  
+  animals[[i]]$mod1 <- gam(Anim ~ s(altitude, bs="tp", k=5) + s(ruggedness, bs="tp", k=5) + s(settlement.index, bs="tp", k=5) + s(mine.density, bs="tp", k=5), data = animals[[i]]$data, family = "binomial", method="REML")
+  print(i)
+  # print(nrow(animals[[i]]$data))
+  # print(summary(animals[[i]]$mod1))
+  
+  animals[[i]]$preds <- raster::predict(mask(predictorsMap,terra::buffer(map36,width = 500)), animals[[i]]$mod1, fun=predFunLink, index=1:2, na.rm = T, inf.rm = T)
+  
+  animals[[i]]$preds$pred <- overlay(animals[[i]]$preds$layer.1,animals[[i]]$preds$layer.2,fun=function(x,y){return(plogis(x+(0*y)))})
+  
+  (animals[[i]]$densMean = sum(animals[[i]]$data$Anim==1)/sum(transects$area))
+  (animals[[i]]$predMean <- cellStats(animals[[i]]$preds$pred, 'mean'))
+  
+  animals[[i]]$preds$predScale <- calc(animals[[i]]$preds$pred,fun=function(x){return((x/animals[[i]]$predMean)*as.numeric(animals[[i]]$densMean)/animals[[i]]$predMean)}) # times more signs than average
+  
+  # signs in /km2
+  animals[[i]]$preds$predDens <- calc(animals[[i]]$preds$pred,fun=function(x){return((x)*as.numeric(animals[[i]]$densMean)/animals[[i]]$predMean)})
+  
+  animals[[i]]$predmax <- cellStats(animals[[i]]$preds$predDens, stat=max)
+  
+}
+```
+
+## Figure 3
+
+Plot distribution predictions across TNR
+
+```{r fig4, echo=FALSE}
+par(mfrow=c(3,2), oma = c(0,0,0,0) + 0, mar = c(0,0,0,0) + 2)
+for (i in names(animals)[-1]){
+  plot(map36.buff, lwd=2, border="white")
+  plot(animals[[i]]$preds$predDens,ext=buffer(map36,width = 100), zlim=c(-(cellStats(animals[[i]]$preds$predDens, max) - cellStats(animals[[i]]$preds$predDens, mean)), cellStats(animals[[i]]$preds$predDens, max)),col=rev(colfunc(100)), asp=1, add=T, legend.args = list(text = as.expression(bquote("signs /" ~ km^2 ~ "")), side = 3, line = 1, adj=0.5))
+  mtext(i)
+  points(spTransform(waypoints[grep(animals[[i]][[1]],waypoints$speciesName),],crs(map36)), col="blue", cex = 0.75, pch = 20)
+  points(animals[[i]]$data[animals[[i]]$data$Anim==1,], col="black", cex = 0.75, pch = 20)
+  scalebar(d = 10000, xy = c(35000,9945000),lonlat = F,label = "10 km", adj=c(0.5,-0.4),lwd = 2)
+}
+# gorillaSeeds[[seedtesting]] <-  animals #this is where the loop ends for iteration testing
+```
+
+```{r, include=FALSE}
+## Plot linear predictor effects setup ----
+
+# Strategy for generate meaningul predictors plots:
+# set 3/4 variables to their mean, predict
+# what is the value of the 4th variable at the mean prediction? 
+# repeat x4 for each predictor.
+
+getOtherMeans <- function(predictor, predictorsMap, i){
+  meanPredictorsMap <- predictorsMap
+  for (j in names(predictorsMap)[names(predictorsMap) %in% predictor == F]){
+    meanPredictorsMap[[j]]<- cellStats(predictorsMap[[j]], stat=mean)
+  }
+  meanPreds <- raster::predict(meanPredictorsMap, animals[[i]]$mod1, fun=predFunResponse, index=1:2, na.rm = T, inf.rm = T)
+  tmp <- meanPreds$layer.1@data@values
+  return(atMean <- meanPredictorsMap[[predictor]][which(abs(tmp - mean(tmp, na.rm=T))==min(abs(tmp - mean(tmp, na.rm=T)),na.rm=T))])
+}
+
+getOtherMeansPlot <- function(predictor, predictorsMap, i){
+  meanPredictorsMap <- predictorsMap
+  for (k in names(predictorsMap)[names(predictorsMap) %in% predictor == F]){
+    meanPredictorsMap[[k]]<- cellStats(predictorsMap[[k]], stat=mean)
+  }
+  meanPreds <- raster::predict(meanPredictorsMap, animals[[i]]$mod1, fun=predFunResponse, index=1:2, na.rm = T, inf.rm = T)
+  plot(meanPreds$layer.1, main="predictor value at other means")
+  tmp <- meanPreds$layer.1@data@values
+  print(paste("compare this to the mean across the reserve of", round(cellStats(predictorsMap[[predictor]], stat=mean),2)))
+  return(atMean <- meanPredictorsMap[[predictor]][which(abs(tmp - mean(tmp, na.rm=T))==min(abs(tmp - mean(tmp, na.rm=T)),na.rm=T))])
+}
+```
+
+## Figure 4
+
+Plot of each linear predictor's effects
+
+```{r fig5, echo=FALSE}
+par(mfrow=c(5,4), mar=c(2,2,2,0)+0.2, oma=c(0,3,0,0)+0)
+par(pch=20, bty="l",las=1)
+
+effects <- as.data.frame(names(predictorsMap)[-5]); names(effects) <- "id"
+effects$name <- c("Altitude (m)", "Terrain ruggedness \n            index", "Settlement index", "Mine density")
+
+for (i in names(animals)[-1]){
+  
+  for (l in 1:nrow(effects)){
+    effect = effects[l,]$id
+    
+    meanPredictorsMap <- predictorsMapClip
+    for (j in names(predictorsMapClip)[names(predictorsMapClip) %in% effect == F][-4]){
+      # set 3/4 variables to that -- effect of the 4th at the mean effects of the others assuming the mean of others
+      meanPredictorsMap[[j]]<- getOtherMeans(j, predictorsMapClip, i)
+    }
+    
+    meanPreds <- predict(meanPredictorsMap, animals[[i]]$mod1, fun=predFunLink, index=1:2, na.rm = T, inf.rm = T)
+    meanPreds$loCI <- overlay(meanPreds$layer.1,meanPreds$layer.2,fun=function(x,y){return(plogis(x-(1.96*y)))})
+    meanPreds$hiCI <- overlay(meanPreds$layer.1,meanPreds$layer.2,fun=function(x,y){return(plogis(x+(1.96*y)))})
+    meanPreds$pred <- overlay(meanPreds$layer.1,meanPreds$layer.2,fun=function(x,y){return(plogis(x+(0*y)))})
+    # signs in /km2
+    meanPreds$predDens <- calc(meanPreds$pred,fun=function(x){return((x)*as.numeric(animals[[i]]$densMean)/animals[[i]]$predMean)})
+    meanPreds$loCiDens <- calc(meanPreds$loCI,fun=function(x){return((x)*as.numeric(animals[[i]]$densMean)/animals[[i]]$predMean)})
+    meanPreds$hiCiDens <- calc(meanPreds$hiCI,fun=function(x){return((x)*as.numeric(animals[[i]]$densMean)/animals[[i]]$predMean)})
+    
+    meanPreds$predInc <- calc(meanPreds$predDens,fun=function(x){return((x) - as.numeric(animals[[i]]$densMean) )})
+    meanPreds$loCiInc <- calc(meanPreds$loCiDens,fun=function(x){return((x) - as.numeric(animals[[i]]$densMean) )})
+    meanPreds$hiCiInc <- calc(meanPreds$hiCiDens,fun=function(x){return((x) - as.numeric(animals[[i]]$densMean) )})
+    
+    
+    rastpts <- as.data.frame(rasterToPoints(meanPreds))
+    rastpts$effect <- rasterToPoints(predictorsMapClip[[effect]])[,3] #exclude lat/lon columns
+    rastpts <- rastpts[order(rastpts$effect),]
+    
+    pval <- (summary(animals[[i]]$mod1)[[8]])[l]
+    pwrite <- ifelse(pval<0.001, "p < 0.001", 
+                     ifelse(pval<0.01, paste("p =", round(pval, 3)),
+                            paste("p =", round(pval, 2))))
+    
+    topxlab <- NA
+    if (i=="a. Gorillas"){
+      topxlab <- effects[l,]$name
+    }
+   
+    if (l==1){
+      plot(predDens ~ effect, data=rastpts, xlab=NA, type="l", lwd=2, main=NA, ylab=NA, ylim = c(-3,15), cex.axis=0.9)
+      mtext(bquote(bold(.(topxlab))), side = 3, line = -0.5, cex=0.8)
+      text(490, 7.2, srt=-45, adj = 0.5, cex=1.1, xpd=NA, srt=-270, labels=bquote(bold(.(i))))
+      text(608, 7.2, srt=-45, adj = 0.5, cex=1.1, xpd=NA, srt=-270, labels=expression(paste("signs/km"^2)))
+    }
+    else {
+      plot(predDens ~ effect, data=rastpts, xlab=NA, main=NA, type="l", lwd=2, ylab=NA, ylim = c(-3,15), cex.axis=0.9)
+      lline <- ifelse(l==2, -1.5, 0)
+      mtext(bquote(bold(.(topxlab))), side = 3, line = lline, cex=0.8)
+    }
+    
+    abline(h=as.numeric(animals[[i]]$densMean), lty=2)
+    lines(loCiDens ~ effect, data=rastpts, lwd=2, col="gray")
+    lines(hiCiDens ~ effect, data=rastpts, lwd=2, col="gray")
+    legend("bottomright", legend=pwrite, bty="n", cex = 0.8, inset = -0.03)
+
+  }
+}
+```
+
+## Test relationship between predictors
+Mining ~ TRI
+```{r}
+dat <- animals[[1]]$data #are mines in the great ape data related to various other factors?
+mod.mine <- gam(settlement.index ~ s(ruggedness, k=9), data = dat, method="REML")
+summary(mod.mine)
+# plot(mod.mine)
+```
+
+## Supplemental Figure
+
+Plot raw data to bins to see how the model does
+
+```{r fig6, echo=FALSE, message=FALSE, warning=FALSE}
+par(mfrow=c(2,3), mar=c(5,6,2,1)+0.2)
+for (i in names(animals)[-1]){
+  gamfit <- as.data.frame(animals[[i]]$data)
+  gamfit$modfit <- animals[[i]]$mod1$fitted.values
+  gamfit$fitbin <- as.numeric(Hmisc::cut2(gamfit$modfit, g=25))
+  
+  binavgs <- aggregate(gamfit[,c("Anim","modfit")], list(as.character(gamfit$fitbin)), FUN=mean)
+  binavgs$fitbin = binavgs$Group.1
+  
+  binsd <- aggregate(gamfit[,c("Anim","modfit")], list(as.character(gamfit$fitbin)), FUN=sd)
+  binsd$fitbin = binsd$Group.1
+  
+  #CI of bins
+  binavgs$lowerCI <- binavgs$Anim - binsd$Anim/sqrt(nrow(gamfit)/25)
+  binavgs$upperCI <- binavgs$Anim + binsd$Anim/sqrt(nrow(gamfit)/25)
+  binavgs$sd <- binsd$Anim
+  binavgs$se <- binsd$Anim/sqrt(nrow(gamfit)/25)
+  
+  if (i %in% names(animals)[-1][c(1,4)]){
+    plot(binavgs[,c(3,2)], xlab="Predicted probability of sign",ylab="Observed sign proportion per bin \n", ylim=c(0,0.08), pch=15, cex=2, main=i, las=1, bty="l", cex.axis=1.2, cex.lab=1.6, cex.main=2)
+    arrows(binavgs$modfit, binavgs$lowerCI, binavgs$modfit, binavgs$upperCI, length=0.05, angle=90, code=3)
+  abline(lm(binavgs[,c(3,2)])); summary(lm(binavgs[,c(3,2)])); abline(0,1,lty=2)
+  summary(lm(binavgs[,c(3,2)]))[9]
+  }
+  
+  else {
+    plot(binavgs[,c(3,2)], xlab="Predicted probability of sign",ylab=NA, ylim=c(0,0.08), pch=15, cex=2, main=i, las=1, bty="l", cex.axis=1.2, cex.lab=1.6, cex.main=2)
+  arrows(binavgs$modfit, binavgs$lowerCI, binavgs$modfit, binavgs$upperCI, length=0.05, angle=90, code=3)
+  abline(lm(binavgs[,c(3,2)])); summary(lm(binavgs[,c(3,2)])); abline(0,1,lty=2)
+  summary(lm(binavgs[,c(3,2)]))[9]
+  }
+  
+}
+```
+
+## Test for Spatial Autocorrelation
+
+```{r spatac} 
+par(mfrow=c(2,3))
+for (i in names(animals)[-1]){
+  plot(var <- variogram(resid(animals[[i]]$mod1, type="scaled.pearson") ~ Longitude + Latitude, data=animals[[i]]$data, cutoff=5000, width=300), pch=16, cex=1.5, main=names(animals[i]))
+}
+```
+
